@@ -3,3 +3,4 @@ adresses
 node_modules
 logs
 .codegpt
+credentials.json
