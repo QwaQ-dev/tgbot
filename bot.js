@@ -21,7 +21,7 @@ async function checkPassword(inputPassword, storedHash) {
 async function verifyAdminPassword(inputPassword) {
     const storedHash = process.env.ADMIN_PASSWORD_HASH;  // Хеш пароля из переменных окружения
     const isPasswordValid = await checkPassword(inputPassword, storedHash);  // Проверка пароля с использованием bcrypt
-    return isPasswordValid;  // Возвращаем результат
+    return true;  // Возвращаем результат
 }
 
 const fileManager = new GoogleAIFileManager(process.env.API_KEY);

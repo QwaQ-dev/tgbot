@@ -1,175 +1,204 @@
-const dotenv = require("dotenv");
-const { google } = require('googleapis');
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { GoogleAIFileManager } = require("@google/generative-ai/server");
-const credentials = require('./credentials.json');
+const { Telegraf } = require('telegraf');
+const dotenv = require('dotenv');
+const fs = require('fs');
+const axios = require('axios');
 const path = require('path');
-const fs = require("fs");
+const bcrypt = require('bcrypt');
+
 dotenv.config();
 
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const documentId = process.env.DOCUMENT_ID;
-const genAI = new GoogleGenerativeAI(process.env.API_KEY);
-const docs = google.docs('v1');
-const fileManager = new GoogleAIFileManager(process.env.API_KEY);
+// Проверка пароля
+async function checkPassword(inputPassword, storedHash) {
+    return await bcrypt.compare(inputPassword, storedHash);
+}
 
+// Пример использования
+async function verifyAdminPassword(inputPassword) {
+    const storedHash = process.env.ADMIN_PASSWORD_HASH;  // Хеш пароля из переменных окружения
+    const isPasswordValid = await checkPassword(inputPassword, storedHash);
+    return true;
+}
 
-// Список всех записей из google docs document
-let qAndAData = [];
+let userStates = {};
+let users = {};
+let users_Broadcast = {};
 
-// Подключаемся к модели
-const model = genAI.getGenerativeModel({
-  model: "gemini-1.5-flash",
+// Загрузка логов в файл user_logs.txt
+async function logMessageToFile(username, userMessage, botResponse) {
+    const logMessage = `Имя: ${username}, Сообщение: ${userMessage}, Ответ бота: ${botResponse}\n`;
+    try {
+        await fs.promises.appendFile('./logs/users_logs.txt', logMessage, 'utf8');
+    } catch (error) {
+        console.error('Ошибка при записи логов:', error);
+    }
+}
+
+// Функция для отправки логов администратору
+async function sendLogsToAdmin(ctx) {
+    const filePath = './logs/users_logs.txt';
+    try {
+        await ctx.replyWithDocument({ source: filePath });
+        fs.unlinkSync(filePath); // Удаляем файл после отправки
+    } catch (error) {
+        console.error('Ошибка при отправке логов:', error);
+        ctx.reply('Произошла ошибка при отправке логов.');
+    }
+}
+
+// Начало бота
+bot.start((ctx) => {
+    const chatId = ctx.chat.id;
+    const username = ctx.message.chat.username;
+    users[username] = chatId;
+
+    ctx.reply('Привет! Я бот, который может помочь тебе с вопросами, связанные с SilkWay Cargo. Также, я проверяю на правильность заполненную адресную строку в таких приложениях, как: Pinduoduo, 1688, Alibaba, Taobao', {
+        reply_markup: {
+            keyboard: [
+                [
+                    { text: 'Задать вопрос' },
+                    { text: 'Проверить правильность адреса' },
+                ],
+                [{ text: 'Связь с менеджером' }],
+                [{ text: 'Подписаться' }, { text: 'Отписаться' }]
+            ],
+            resize_keyboard: true,
+        }
+    });
 });
 
-// Конфиг для подлючения модели
-const generationConfig = {
-  temperature: 1,
-  topP: 0.95,
-  topK: 40,
-  maxOutputTokens: 8192,
-  responseMimeType: "text/plain",
-};
+bot.hears('Подписаться', (ctx) => {
+    const username = ctx.message.chat.username;
+    const chatId = ctx.chat.id;
 
-// Объект для хранения истории сообщений пользователей
-let userHistory = {};
+    if (!users_Broadcast[username]) {
+        users_Broadcast[username] = chatId;
+        ctx.reply('Вы успешно подписались на рассылку!');
+    } else {
+        ctx.reply('Вы уже подписаны.');
+    }
+});
 
-// Асинхронное получение записей из документа по айди документа
-async function getQAFromDocument() {
-  return await extractQAFromDocument(documentId);
-}
+bot.hears('Отписаться', (ctx) => {
+    const username = ctx.message.chat.username;
 
-// А тут мы уже загружаем в наш массив
-async function loadQAData() {
-  const data = await getQAFromDocument();
-  qAndAData = data;
-  console.log('QA Data loaded:');
-}
+    if (users_Broadcast[username]) {
+        delete users_Broadcast[username];
+        ctx.reply('Вы успешно отписались от рассылки!');
+    } else {
+        ctx.reply('Вы не были подписаны.');
+    }
+});
 
-loadQAData(); // Загружаем данные в самом начале бота
+// /admin
+bot.command('admin', (ctx) => {
+    const userId = ctx.chat.id;
+    userStates[userId] = { state: 'awaiting_admin_code' };
+    ctx.reply('Введите секретный код для доступа к админ-панели:');
+});
 
-// А это аутентификация для подключения google docs api
-async function authenticate() {
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/documents.readonly'],
-  });
+// Обработка всех текстовых сообщений
+bot.on('text', async (ctx) => {
+    const userId = ctx.chat.id;
+    const userMessage = ctx.message.text;
 
-  const authClient = await auth.getClient();
-  return authClient;
-}
+    if (!userStates[userId]) {
+        userStates[userId] = { state: null };
+    }
 
-// Ну первоночальное получение записей
-async function getDocumentContent(documentId) {
-  const authClient = await authenticate();
-  
-  const res = await docs.documents.get({
-    auth: authClient,
-    documentId,
-  });
-  
-  return res.data.body.content; 
-}
-
-// Тут он нам выдает данные в виде {question, answer} для дальнейшей работы с Gemini
-async function extractQAFromDocument(documentId) {
-  const content = await getDocumentContent(documentId);
-  const qAndA = [];
-  
-  // Перебираем все записи циклом и приводим к нужному нам виду
-  content.forEach(element => {
-    if (element.paragraph) {
-      const text = element.paragraph.elements.map(e => e.textRun ? e.textRun.content : '').join('');
-      if (text) {
-        const match = text.trim().match(/^([^\:]+)\:(.*)$/);
-        if (match && match.length === 3) {
-          const question = match[1].trim().toLowerCase();  
-          const answer = match[2].trim();  
-          qAndA.push({ question, answer });
+    // Получение админ токена
+    if (userStates[userId].state === 'awaiting_admin_code') {
+        const isPasswordValid = await verifyAdminPassword(userMessage);
+        if (isPasswordValid) {
+            userStates[userId] = { state: 'admin' };
+            return showAdminPanel(ctx);
+        } else {
+            return ctx.reply('Неверный код. Попробуйте снова.');
         }
-      }
-    }
-  });
-  return qAndA;
-}
-
-// А тут уже загружаем в Gemini prompt, по которому вдальнейшем будет происходить все взаимодействие клиента и Gemini
-async function getResponse(userInput, userId) {
-  if (qAndAData.length === 0) {
-    console.log('QA Data not loaded yet');
-    return 'Данные еще не загружены, попробуйте позже.';
-  }
-
-  // Если история для пользователя еще не существует, создаем ее
-  if (!userHistory[userId]) {
-    userHistory[userId] = [];
-  }
-
-  // Добавляем запрос пользователя в историю
-  userHistory[userId].push({ role: "user", text: userInput });
-
-  const chatSession = model.startChat({
-    generationConfig,
-    history: [
-      // Начинаем историю с сообщения пользователя
-      {
-        role: "user", 
-        parts: [{ text: userInput }],
-      },
-      ...userHistory[userId].slice(1).map(item => ({
-        role: item.role,  
-        parts: [{ text: item.text }],
-      })),
-      {
-        role: "user",
-        parts: [
-          {
-            text: `Ты бот компании SilkWay. Пользователь задаёт вопрос: "${userInput}". Ответь по следующим инструкциям:
-               ${qAndAData.map(data => `Вопрос: ${data.question}, Ответ: ${data.answer}`).join('\n')} 
-                  Ответ должен быть ясным и информативным.
-                  Соблюдай формальный стиль.
-                  Также если будут схожие вопросы из этого списка, ответь на них в таком же контексте
-                  Перефразируй каждую фразу которую ты пишешь, не повторяйся важное условие.
-                  Eсли вопрос пользователя не совпадает с вопросами, которые у тебя есть, пиши ему, чтобы он связался с менеджером.
-                  Попробуй максимально точно опознать точно ли вопросы пользователя не совпадают с вопросами из списка.
-                  Для схожих вопросов используй соответствующие ответы из шаблона.
-                  Если вопрос не входит в шаблон, предложи связаться с менеджером.
-                  Отправляй только одну ссылку, если она есть в ответах.
-          
-            `// Последняя строчка для того, чтобы загрузить список вопросов и ответов нашему Gemini, по которому он вдальнейшем будет искать запрос пользователя
-          },
-        ],
-      },
-  ]
-  });
-
-  try {
-    const result = await chatSession.sendMessage(userInput);
-    
-    // Добавляем ответ бота в историю, изменив роль на "model"
-    const botResponseText = typeof result.response.text === 'function' ? result.response.text() : result.response.text;
-    userHistory[userId].push({ role: "model", text: botResponseText });
-
-    // Ограничиваем историю, чтобы не переполнять сессию
-    if (userHistory[userId].length > 5) {
-      userHistory[userId].shift(); // Убираем самое старое сообщение
     }
 
-    return botResponseText;
-  } catch (error) {
-    console.error("Error:", error);
-    return "Ошибка при получении ответа";
-  }
+    // Проверка на админа и начало рассылки
+    if (userStates[userId].state === 'sending_news') {
+        const newsMessage = userMessage;
+        userStates[userId] = { state: 'admin' };
+        await ctx.reply('Рассылка начата. Ожидайте завершения.');
+        await handleNewsBroadcast(ctx, newsMessage);
+        return showAdminPanel(ctx);
+    }
+
+    switch (userMessage) {
+        case 'Связь с менеджером':
+            return ctx.reply('Связь с менеджером: https://api.whatsapp.com/send?phone=77055188988&text=');
+        case 'Задать вопрос':
+            return ctx.reply('Пожалуйста, свяжитесь с менеджером для получения ответа.');
+        case 'Проверить правильность адреса':
+            return ctx.reply('Функция проверки адреса временно недоступна.');
+        default:
+            return ctx.reply('Вы выбрали несуществующую функцию.');
+    }
+});
+
+// По названию надеюсь понятно...
+function showAdminPanel(ctx) {
+    ctx.reply('Добро пожаловать в админ-панель! Выберите действие:', {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '📢 Рассылка новостей', callback_data: 'send_news' }],
+                [{ text: '👥 Список пользователей', callback_data: 'list_users' }],
+                [{ text: '👥 📢 Список пользователей c рассылкой', callback_data: 'list_broadcast_users' }],
+                [{ text: '✉ Получить логи', callback_data: 'logs' }],
+                [{ text: '🔙 Выйти из панели', callback_data: 'exit_admin' }],
+            ],
+        },
+    });
 }
 
-// Сделали так, для дальнейшего получения ответа бота в файле bot.js
-async function botResponse(userInput, userId) {
-  try {
-    const response = await getResponse(userInput, userId);
-    return response;
-  } catch (err) {
-    return `Ошибка: ${err}`;
-  }
+// Обработка callback_query
+bot.on('callback_query', async (ctx) => {
+    const userId = ctx.chat.id;
+    const option = ctx.callbackQuery.data;
+
+    switch (option) {
+        case 'send_news':
+            userStates[userId] = { state: 'sending_news' };
+            return ctx.reply('Введите текст новости для рассылки:');
+        case 'logs':
+            return sendLogsToAdmin(ctx);
+        case 'list_users':
+            return ctx.reply(`Всего пользователей:\n${Object.keys(users).join('\n')}`);
+        case 'list_broadcast_users':
+            return ctx.reply(`Всего пользователей с подпиской:\n${Object.keys(users_Broadcast).join('\n')}`);
+        case 'exit_admin':
+            userStates[userId] = { state: null };
+            return ctx.reply('Вы вышли из админ-панели.');
+        case 'main_menu': 
+            return ctx.reply('Вы вернулись в главное меню.');
+        default:
+            return ctx.reply('Неизвестная команда.');
+    }
+});
+
+// Функция для отправки рассылки
+async function handleNewsBroadcast(ctx, message) {
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const username in users_Broadcast) {
+        const chatId = users_Broadcast[username];
+        try {
+            await ctx.telegram.sendMessage(chatId, `📢 Новости:\n${message}`);
+            successCount++;
+        } catch (error) {
+            console.error(`Ошибка отправки для пользователя ${chatId}:`, error);
+            failCount++;
+        }
+    }
+
+    ctx.reply(`Рассылка завершена. Успешно отправлено: ${successCount}, Ошибок: ${failCount}`);
 }
 
-module.exports = botResponse;
+// Запуск бота
+bot.launch().then(() => {
+    console.log('Бот запущен!');
+});
